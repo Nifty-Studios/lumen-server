@@ -31,3 +31,18 @@ Build from the Lumen root so `shared/` is in the build context:
 docker build -f server/Dockerfile -t lumen-server .
 docker run -d -p 8787:8787 -v lumen-data:/data -e LUMEN_TOKEN=... lumen-server
 ```
+
+## Fly.io
+
+`fly.toml` runs one small machine (256 MB, stops when idle) with the SQLite file on a volume. The image needs `../shared`, so deploy with the script, which stages a minimal build context in `.fly-build/` and runs `fly deploy` there:
+
+```sh
+fly auth login
+fly apps create lumen-sync                     # once; app names are global, change `app` in fly.toml if taken
+fly volumes create lumen_data --size 1 --region lhr -a lumen-sync   # once
+fly secrets set LUMEN_TOKEN=$(openssl rand -hex 32) -a lumen-sync   # once; keep the token for the clients
+bun run deploy
+curl https://lumen-sync.fly.dev/health
+```
+
+Keep it at one machine: SQLite lives on the volume.

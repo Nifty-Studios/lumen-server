@@ -17,5 +17,5 @@ ENV LUMEN_DB=/data/lumen-server.db PORT=8787
 RUN mkdir -p /data && chown bun:bun /data
 VOLUME /data
 EXPOSE 8787
-USER bun
-CMD ["bun", "src/index.ts"]
+# Volumes (Fly's in particular) can mount root-owned: fix ownership, then drop to the bun user.
+CMD ["sh", "-c", "chown bun:bun /data && exec setpriv --reuid=bun --regid=bun --init-groups bun src/index.ts"]

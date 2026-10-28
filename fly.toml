@@ -1,0 +1,34 @@
+# Deploy with `bun run deploy` (scripts/fly-deploy.ts), not `fly deploy` directly:
+# the image needs ../shared, so the script stages server + shared into one build context.
+app = "lumen-sync"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  LUMEN_DB = "/data/lumen-server.db"
+  PORT = "8787"
+
+# One machine with one volume: SQLite lives on it, so never scale past 1.
+[mounts]
+  source = "lumen_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
