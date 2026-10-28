@@ -1,0 +1,8 @@
+# Used by BuildKit for Dockerfile (context = Lumen root). Allow-list only what the image needs.
+*
+!shared/package.json
+!shared/src
+shared/src/**/*.test.ts
+!server/package.json
+!server/src
+server/src/**/*.test.ts
