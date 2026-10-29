@@ -11,7 +11,8 @@ import { createLumen, isGroup, pageTitle, type Lumen, type PageNode, type SqlDri
 import { pageToMarkdown } from "@lumen/shared/export";
 import type { UserRow } from "@lumen/shared/schema/server";
 
-const IDLE_MS = 10 * 60_000;
+/** An AI link's client is dropped after this long unused, freeing its copy of the notes. */
+const IDLE_MS = 3 * 60_000;
 
 function memoryDriver(): SqlDriver {
   const conn = new Database(":memory:");

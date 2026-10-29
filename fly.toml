@@ -2,6 +2,8 @@
 # the image needs ../shared, so the script stages server + shared into one build context.
 app = "lumen-sync"
 primary_region = "lhr"
+# Swap: a safety net for memory spikes, so they slow down instead of being killed.
+swap_size_mb = 512
 
 [build]
   dockerfile = "Dockerfile"
@@ -29,6 +31,9 @@ primary_region = "lhr"
     timeout = "5s"
     grace_period = "10s"
 
+# 512 MB (raised from 256 MB on 2026-10-29): the AI connection keeps a copy of a person's
+# notes in memory while it works, which got the 256 MB machine OOM-killed. The machine still
+# stops when idle.
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "256mb"
+  memory = "512mb"
