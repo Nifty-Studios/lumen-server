@@ -3,6 +3,7 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
+import { cors } from "hono/cors";
 import { asc, gt } from "drizzle-orm";
 import { pullQuerySchema, pushRequestSchema, type PullResponse, type PushResponse } from "@lumen/shared";
 import { server_ops } from "@lumen/shared/schema/server";
@@ -16,6 +17,10 @@ const sameToken = (given: string, expected: string) => {
 
 export function createApp(db: Db, token: string) {
   const app = new Hono();
+
+  // The desktop app calls from a webview origin. Any origin is fine: auth is a bearer token
+  // that browsers never attach on their own. Preflights are answered before the auth check.
+  app.use("*", cors({ origin: "*", allowHeaders: ["authorization", "content-type"], allowMethods: ["GET", "POST"], maxAge: 86400 }));
 
   app.get("/health", (c) => c.json({ ok: true }));
 

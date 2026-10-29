@@ -59,6 +59,15 @@ describe("sync server", () => {
     expect(rest.ops.map((o: Op) => o.id)).toEqual(["3"]);
   });
 
+  it("answers CORS preflights without the token", async () => {
+    const res = await setup().request("/sync/push", {
+      method: "OPTIONS",
+      headers: { origin: "http://tauri.localhost", "access-control-request-method": "POST", "access-control-request-headers": "authorization,content-type" },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
   it("rejects malformed pushes", async () => {
     const res = await setup().request("/sync/push", { method: "POST", headers: auth, body: JSON.stringify({ ops: [{ id: 1 }] }) });
     expect(res.status).toBe(400);
