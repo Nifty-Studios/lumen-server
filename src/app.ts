@@ -21,9 +21,10 @@ import {
   type PullResponse,
   type PushResponse,
 } from "@lumen/shared";
-import { invites, page_shares, server_ops, server_records, space_members, type UserRow } from "@lumen/shared/schema/server";
+import { invites, page_shares, server_ops, server_records, sessions, space_members, type UserRow } from "@lumen/shared/schema/server";
 import { checkPush, createRegistry, loadGrants } from "./access";
 import { createAuth, createLimiter } from "./auth";
+import { createAgents } from "./mcp";
 import type { Db } from "./db";
 import type { Hub } from "./live";
 
@@ -99,7 +100,45 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
     c.set("token", token);
     await next();
   };
-  for (const path of ["/auth/logout", "/auth/claim-legacy", "/me", "/sync/*", "/spaces/*", "/pages/*"]) app.use(path, signedIn);
+  for (const path of ["/auth/logout", "/auth/claim-legacy", "/auth/ai-links", "/auth/ai-links/*", "/me", "/sync/*", "/spaces/*", "/pages/*"])
+    app.use(path, signedIn);
+
+  // --- AI connection (MCP) ---
+
+  const AI_DEVICE = "AI connection";
+  // The agents sync through this app in-process, as any device would.
+  const agents = createAgents(((input: string | URL | Request, init?: RequestInit) => app.request(String(input), init)) as typeof fetch);
+  const linkFor = (c: Context, token: string) => {
+    const host = c.req.header("host") ?? "localhost";
+    const proto = c.req.header("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
+    return `${proto}://${host}/mcp/${token}`;
+  };
+
+  app.get("/auth/ai-links", (c) => {
+    const rows = db.select().from(sessions).where(and(eq(sessions.user_id, c.get("user").id), eq(sessions.device_name, AI_DEVICE))).all();
+    return c.json({ links: rows.map((r) => ({ id: r.id, created_at: r.created_at, last_used_at: r.last_seen_at })) });
+  });
+  app.post("/auth/ai-links", (c) => {
+    const token = auth.startSession(c.get("user").id, AI_DEVICE);
+    return c.json({ url: linkFor(c, token) });
+  });
+  app.delete("/auth/ai-links/:id", (c) => {
+    db.delete(sessions).where(and(eq(sessions.id, c.req.param("id")), eq(sessions.user_id, c.get("user").id), eq(sessions.device_name, AI_DEVICE))).run();
+    return c.json({ ok: true });
+  });
+
+  app.get("/mcp/:token", (c) => c.json({ error: "Use POST (MCP streamable HTTP)." }, 405));
+  app.post("/mcp/:token", async (c) => {
+    const token = c.req.param("token");
+    const user = auth.authenticate(token);
+    if (!user) return c.json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "This AI link was revoked or is wrong." } }, 401);
+    const body = await c.req.json().catch(() => null);
+    if (!body) return c.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+    const batch = Array.isArray(body);
+    const replies = (await Promise.all((batch ? body : [body]).map((m) => agents.handle(token, user, m)))).filter(Boolean);
+    if (!replies.length) return c.body(null, 202);
+    return c.json(batch ? replies : replies[0]);
+  });
 
   app.post("/auth/logout", (c) => {
     auth.logOut(c.get("token"));

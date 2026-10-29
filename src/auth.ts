@@ -77,7 +77,7 @@ export function createAuth(db: Db) {
   const findUser = (email: string) => db.select().from(users).where(eq(users.email, email)).get();
   const getUser = (id: string) => db.select().from(users).where(eq(users.id, id)).get();
 
-  return { signUp, logIn, logOut, authenticate, findUser, getUser, acceptInvites };
+  return { signUp, logIn, logOut, authenticate, findUser, getUser, acceptInvites, startSession };
 }
 
 export type Auth = ReturnType<typeof createAuth>;

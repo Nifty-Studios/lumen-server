@@ -270,3 +270,49 @@ describe("from the shared token to accounts", () => {
     expect((await phone.getSpace())!.id).toBe(space.id);
   });
 });
+
+describe("AI connection (MCP)", () => {
+  it("lets an assistant read, write and sort notes, and the devices see it", async () => {
+    const db = openDb(":memory:");
+    const { app } = createApp(db, {});
+    const fetch = ((input: string | URL | Request, init?: RequestInit) => app.request(String(input), init)) as typeof globalThis.fetch;
+    const desk = createLumen(bunDriver(), { server: { url: "https://sync.test", deviceName: "desktop", fetch } });
+    await signIn(desk, "ada@lumen.test");
+    const token = desk.account.current!.token;
+
+    const created = await app.request("/auth/ai-links", { method: "POST", headers: { authorization: `Bearer ${token}`, host: "sync.test" } });
+    const { url } = (await created.json()) as { url: string };
+    expect(url).toMatch(/^https:\/\/sync\.test\/mcp\/.+/);
+    const mcp = async (method: string, params?: object) => {
+      const res = await app.request(new URL(url).pathname, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      return ((await res.json()) as { result: any }).result;
+    };
+    const tool = async (name: string, args: object) => (await mcp("tools/call", { name, arguments: args })).content[0].text as string;
+
+    expect((await mcp("initialize", { protocolVersion: "2025-06-18" })).serverInfo.name).toBe("lumen");
+    expect((await mcp("tools/list")).tools.map((t: { name: string }) => t.name)).toContain("write_page");
+    expect(await tool("list_pages", {})).toContain("Welcome to Lumen");
+
+    const made = await tool("create_page", { title: "Groceries", markdown: "- oat milk\n- bread" });
+    const pageId = made.match(/id: ([\w-]+)/)![1]!;
+    const group = (await tool("create_group", { name: "Home" })).match(/id: ([\w-]+)/)![1]!;
+    await tool("move_page", { page_id: pageId, to_id: group });
+    expect(await tool("read_page", { page_id: pageId })).toContain("oat milk");
+    expect(await tool("search", { query: "bread" })).toContain("Groceries");
+
+    // The desktop sees it all after a pull.
+    await desk.sync!.sync();
+    const tree = await desk.pageTree((await desk.getSpace())!);
+    const home = tree.find((n) => n.page.id === group)!;
+    expect(home.children.map((n) => pageTitle(n.page))).toEqual(["Groceries"]);
+
+    // Revoked links stop working.
+    const { links } = (await (await app.request("/auth/ai-links", { headers: { authorization: `Bearer ${token}` } })).json()) as { links: { id: string }[] };
+    await app.request(`/auth/ai-links/${links[0]!.id}`, { method: "DELETE", headers: { authorization: `Bearer ${token}` } });
+    expect((await app.request(new URL(url).pathname, { method: "POST", body: "{}" })).status).toBe(401);
+  });
+});

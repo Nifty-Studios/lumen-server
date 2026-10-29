@@ -8,7 +8,7 @@ WORKDIR /app
 COPY server/package.json ./
 RUN bun -e 'const f="package.json",p=JSON.parse(await Bun.file(f).text());delete p.dependencies["@lumen/shared"];await Bun.write(f,JSON.stringify(p))' \
  && bun install --production \
- && bun add zod@^4.6.7
+ && bun add zod@^4.6.7 fflate@^0.8.2
 COPY shared/package.json node_modules/@lumen/shared/package.json
 COPY shared/src node_modules/@lumen/shared/src
 COPY server/src src
