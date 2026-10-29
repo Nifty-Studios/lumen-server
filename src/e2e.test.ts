@@ -3,7 +3,7 @@
 
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import { createLumen, pageTitle, UnsyncedChangesError, type Lumen, type RemoteUpdate, type SqlDriver } from "@lumen/shared/client";
+import { AccountSwitchError, createLumen, pageTitle, type Lumen, type RemoteUpdate, type SqlDriver } from "@lumen/shared/client";
 import { ops as clientOps } from "@lumen/shared/schema/client";
 import { server_ops } from "@lumen/shared/schema/server";
 import { backfillRegistry, createApp } from "./app";
@@ -32,10 +32,14 @@ function bunDriver(): SqlDriver {
 function world() {
   const db = openDb(":memory:");
   const { app } = createApp(db, { legacyToken: LEGACY });
-  const fetch = ((input: string | URL | Request, init?: RequestInit) => app.request(String(input), init)) as typeof globalThis.fetch;
+  const net = { online: true };
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (!net.online) throw new TypeError("fetch failed");
+    return app.request(String(input), init);
+  }) as typeof globalThis.fetch;
   const device = (name: string, legacyToken?: string) =>
     createLumen(bunDriver(), { server: { url: "https://sync.test", deviceName: name, fetch, legacyToken } });
-  return { db, device };
+  return { db, device, net };
 }
 
 const titles = async (lumen: Lumen) => (await lumen.pageTree((await lumen.getSpace())!)).map((n) => pageTitle(n.page));
@@ -44,9 +48,8 @@ const para = (id: string, text: string) => ({ id, type: "paragraph", props: {}, 
 /** First launch through sign-up (or log-in) and connect, as the apps do it. */
 async function signIn(lumen: Lumen, email: string, mode: "signup" | "login" = "signup") {
   expect(await lumen.start()).toEqual({ needsAuth: true });
-  if (mode === "signup") await lumen.account.signUp({ email, password: PASSWORD, name: email.split("@")[0]! });
-  else await lumen.account.logIn({ email, password: PASSWORD });
-  await lumen.connect();
+  if (mode === "signup") await lumen.signUp({ email, password: PASSWORD, name: email.split("@")[0]! });
+  else await lumen.logIn({ email, password: PASSWORD });
   return lumen;
 }
 
@@ -111,28 +114,69 @@ describe("devices on one account", () => {
     expect(later.account.reminderDue()).toBe(false); // not right away
     const local = (await later.getSpace())!.id;
 
-    await later.account.logIn({ email: "ada@lumen.test", password: PASSWORD });
-    await later.connect();
+    await later.logIn({ email: "ada@lumen.test", password: PASSWORD });
     const spaces = await later.listSpaces();
     expect(spaces).toHaveLength(1);
     expect(spaces[0]!.space.id).not.toBe(local);
   });
 
-  it("won't sign out over unsynced changes unless told to, and then clears the device", async () => {
+  it("keeps the last account's notes on the device, and swaps them when someone else signs in", async () => {
     const w = world();
-    const desktop = await signIn(w.device("desktop"), "ada@lumen.test");
-    await desktop.sync!.sync();
-    await desktop.signOut();
-    expect(await desktop.listSpaces()).toEqual([]);
-    expect(await desktop.start()).toEqual({ needsAuth: true });
+    const desk = await signIn(w.device("desktop"), "ada@lumen.test");
+    const adaPage = await desk.createPage((await desk.getSpace())!, null);
+    await desk.renamePage(adaPage, "Ada's page");
+    await desk.sync!.sync();
+    const bo = await signIn(w.device("bo's phone"), "bo@lumen.test");
+    await bo.renamePage(await bo.createPage((await bo.getSpace())!, null), "Bo's page");
+    await bo.sync!.sync();
 
-    const phone = await signIn(w.device("phone"), "ada@lumen.test", "login");
-    expect(await titles(phone)).toEqual(["Welcome to Lumen"]);
-    await phone.renamePage((await phone.pageTree((await phone.getSpace())!))[0]!.page.id, "Offline edit");
-    await phone.account.expire(); // as if the server stopped accepting the session
-    await expect(phone.signOut()).rejects.toBeInstanceOf(UnsyncedChangesError);
-    await phone.signOut({ force: true });
-    expect(await phone.unsyncedCount()).toBe(0);
+    // Ada signs out: her notes stay and keep working offline; nothing syncs.
+    await desk.signOut();
+    expect(desk.account.current).toBeUndefined();
+    expect(await titles(desk)).toEqual(["Welcome to Lumen", "Ada's page"]);
+    await desk.renamePage(adaPage, "Ada's page (offline edit)");
+    expect(await desk.start()).toEqual({ needsAuth: false });
+
+    // Bo signs in while offline: Ada's unsent edit can't be delivered, so nothing is replaced.
+    w.net.online = false;
+    const offline = await desk.logIn({ email: "bo@lumen.test", password: PASSWORD }).catch((e) => e);
+    expect(offline).toMatchObject({ status: 0 }); // AccountError: can't reach the server to log in
+    expect(await titles(desk)).toEqual(["Welcome to Lumen", "Ada's page (offline edit)"]);
+    w.net.online = true;
+
+    // Online: Ada's edit goes to her account first, then the device holds Bo's notes only.
+    await desk.logIn({ email: "bo@lumen.test", password: PASSWORD });
+    expect(desk.account.current?.user.email).toBe("bo@lumen.test");
+    expect(await titles(desk)).toEqual(["Welcome to Lumen", "Bo's page"]);
+    expect(await desk.getBlock(adaPage)).toBeUndefined();
+    const adaPhone = await signIn(w.device("ada's phone"), "ada@lumen.test", "login");
+    expect(await titles(adaPhone)).toEqual(["Welcome to Lumen", "Ada's page (offline edit)"]);
+
+    // And back: Ada signs in again and her notes return.
+    await desk.signOut();
+    await desk.logIn({ email: "ada@lumen.test", password: PASSWORD });
+    expect(await titles(desk)).toEqual(["Welcome to Lumen", "Ada's page (offline edit)"]);
+  });
+
+  it("asks before dropping the previous account's unsent changes", async () => {
+    const w = world();
+    const desk = await signIn(w.device("desktop"), "ada@lumen.test");
+    await desk.sync!.sync();
+    await signIn(w.device("bo's phone"), "bo@lumen.test");
+    await desk.signOut();
+    await desk.renamePage((await desk.pageTree((await desk.getSpace())!))[0]!.page.id, "Unsent");
+    // Ada's session has ended elsewhere, so her change can't be delivered.
+    await w.db.delete((await import("@lumen/shared/schema/server")).sessions).run();
+
+    const err = await desk.logIn({ email: "bo@lumen.test", password: PASSWORD }).catch((e) => e);
+    expect(err).toBeInstanceOf(AccountSwitchError);
+    expect(err).toMatchObject({ pending: 2, owner: "ada@lumen.test" });
+    expect(desk.account.current).toBeUndefined();
+    expect(await titles(desk)).toEqual(["Unsent"]);
+
+    await desk.logIn({ email: "bo@lumen.test", password: PASSWORD }, { discardUnsent: true });
+    expect(await titles(desk)).toEqual(["Welcome to Lumen"]);
+    expect(await desk.unsyncedCount()).toBe(0);
   });
 });
 
@@ -220,8 +264,7 @@ describe("from the shared token to accounts", () => {
     backfillRegistry(w.db);
 
     // Now it signs in: the old workspace becomes the account's, and other devices get it.
-    await old.account.signUp({ email: "ada@lumen.test", password: PASSWORD, name: "Ada" });
-    await old.connect();
+    await old.signUp({ email: "ada@lumen.test", password: PASSWORD, name: "Ada" });
     expect((await old.listSpaces()).map((s) => [s.space.id, s.role])).toEqual([[space.id, "owner"]]);
     const phone = await signIn(w.device("phone"), "ada@lumen.test", "login");
     expect((await phone.getSpace())!.id).toBe(space.id);
