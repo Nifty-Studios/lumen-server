@@ -19,4 +19,5 @@ for (const [name, root] of [["server", server], ["shared", shared]] as const) {
 }
 
 const proc = Bun.spawnSync(["fly", "deploy", ...process.argv.slice(2)], { cwd: stage, stdio: ["inherit", "inherit", "inherit"] });
+rmSync(stage, { recursive: true, force: true });
 process.exit(proc.exitCode ?? 1);
