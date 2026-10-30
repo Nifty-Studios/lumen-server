@@ -5,10 +5,12 @@
 import { timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
-import { and, asc, eq, gt, inArray, isNull, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray } from "drizzle-orm";
 import {
   canEdit,
   inviteRequestSchema,
+  plainText,
+  type RichText,
   logInRequestSchema,
   pullQuerySchema,
   pushRequestSchema,
@@ -25,6 +27,7 @@ import { invites, page_shares, server_ops, server_records, sessions, space_membe
 import { checkPush, createRegistry, loadGrants } from "./access";
 import { createAuth, createLimiter } from "./auth";
 import { createAgents } from "./mcp";
+import { addNotification, mountSocial, shareNotification } from "./social";
 import type { Db } from "./db";
 import type { Hub } from "./live";
 
@@ -51,7 +54,7 @@ export interface AppOptions {
 
 export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
   const app = new Hono<Env>();
-  const auth = createAuth(db);
+  const auth = createAuth(db, (userId, n) => addNotification(db, hub, userId, n));
   const limiter = createLimiter();
 
   // The desktop app calls from a webview origin. Any origin is fine: auth is a bearer token
@@ -100,8 +103,10 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
     c.set("token", token);
     await next();
   };
-  for (const path of ["/auth/logout", "/auth/claim-legacy", "/auth/ai-links", "/auth/ai-links/*", "/me", "/sync/*", "/spaces/*", "/pages/*"])
+  for (const path of ["/auth/logout", "/auth/claim-legacy", "/auth/ai-links", "/auth/ai-links/*", "/me", "/sync/*", "/spaces/*", "/pages/*", "/notifications", "/notifications/*", "/friends", "/friends/*", "/dictionary"])
     app.use(path, signedIn);
+
+  mountSocial(app, db, hub);
 
   // --- AI connection (MCP) ---
 
@@ -242,6 +247,18 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
 
   // --- sharing ---
 
+  /** A page's or workspace's name from its latest ops, for apps that don't send it. */
+  const nameFromOps = (id: string) => {
+    for (const op of db.select().from(server_ops).where(eq(server_ops.record_id, id)).orderBy(desc(server_ops.seq)).limit(200).all()) {
+      const [a, b] = op.path;
+      const v = op.value as unknown;
+      if (a === "name" && typeof v === "string") return v;
+      if (a === "properties" && b === "title") return plainText(v as RichText);
+      if (a === "properties" && !b && v && typeof v === "object" && "title" in v) return plainText((v as { title: RichText }).title);
+    }
+    return undefined;
+  };
+
   const nameOf = (userId: string) => auth.getUser(userId);
 
   const spacePeople = (spaceId: string): Person[] => [
@@ -280,9 +297,11 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
       .map((i) => ({ email: i.email, role: i.role, pending: true })),
   ];
 
-  const invite = (kind: "space" | "page", targetId: string, spaceId: string, email: string, role: Person["role"], by: string) => {
+  const invite = (kind: "space" | "page", targetId: string, spaceId: string, email: string, role: Person["role"], by: string, title?: string) => {
     db.delete(invites).where(and(eq(invites.email, email), eq(invites.target_id, targetId))).run();
-    db.insert(invites).values({ id: crypto.randomUUID(), email, kind, target_id: targetId, space_id: spaceId, role, invited_by: by, created_at: Date.now() }).run();
+    db.insert(invites)
+      .values({ id: crypto.randomUUID(), email, kind, target_id: targetId, space_id: spaceId, role, invited_by: by, created_at: Date.now(), title: title ?? null })
+      .run();
   };
 
   app.get("/spaces/:id/members", (c) => {
@@ -297,12 +316,13 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
     if (loadGrants(db, me.id).spaces.get(id) !== "owner") return c.json({ error: "Only owners can invite people to a workspace." }, 403);
     const parsed = inviteRequestSchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) return c.json({ error: "Enter a valid email." }, 400);
-    const { email, role } = parsed.data;
+    const { email, role, title } = parsed.data;
     if (email === me.email) return c.json({ error: "You're already in this workspace." }, 400);
     const target = auth.findUser(email);
     if (target) {
       const current = db.select().from(space_members).where(and(eq(space_members.space_id, id), eq(space_members.user_id, target.id))).get();
       if (current?.role === "owner" && role !== "owner" && ownerCount(id) <= 1) return c.json({ error: "A workspace needs at least one owner." }, 400);
+      if (!current) addNotification(db, hub, target.id, shareNotification("space", me, title ?? nameFromOps(id), role, id, id));
       db.insert(space_members)
         .values({ space_id: id, user_id: target.id, role, added_at: Date.now() })
         .onConflictDoUpdate({ target: [space_members.space_id, space_members.user_id], set: { role } })
@@ -310,7 +330,7 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
       // A page share inside this workspace is now redundant.
       db.delete(page_shares).where(and(eq(page_shares.space_id, id), eq(page_shares.user_id, target.id))).run();
       hub?.notify([target.id], { type: "access" });
-    } else invite("space", id, id, email, role, me.id);
+    } else invite("space", id, id, email, role, me.id, title ?? nameFromOps(id));
     return c.json({ people: spacePeople(id) });
   });
 
@@ -359,16 +379,19 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
     if (!canEdit(page.spaceRole)) return c.json({ error: "Only workspace members who can edit can share pages." }, 403);
     const parsed = inviteRequestSchema.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success || parsed.data.role === "owner") return c.json({ error: "Enter a valid email and pick Editor or Viewer." }, 400);
-    const { email, role } = parsed.data;
+    const { email, role, title } = parsed.data;
+    if (email === me.email) return c.json({ error: "You can already see this page." }, 400);
     const target = auth.findUser(email);
     if (target) {
       if (loadGrants(db, target.id).spaces.has(page.spaceId)) return c.json({ error: "They're already in this workspace, so they can see this page." }, 409);
+      const had = db.select().from(page_shares).where(and(eq(page_shares.page_id, page.id), eq(page_shares.user_id, target.id))).get();
+      if (!had) addNotification(db, hub, target.id, shareNotification("page", me, title ?? nameFromOps(page.id), role, page.id, page.spaceId));
       db.insert(page_shares)
         .values({ page_id: page.id, user_id: target.id, space_id: page.spaceId, role, added_at: Date.now() })
         .onConflictDoUpdate({ target: [page_shares.page_id, page_shares.user_id], set: { role } })
         .run();
       hub?.notify([target.id], { type: "access" });
-    } else invite("page", page.id, page.spaceId, email, role, me.id);
+    } else invite("page", page.id, page.spaceId, email, role, me.id, title ?? nameFromOps(page.id));
     return c.json({ people: pagePeople(page.id) });
   });
 

@@ -6,12 +6,13 @@ import { eq } from "drizzle-orm";
 import { uuidv7 } from "@lumen/shared";
 import { invites, page_shares, sessions, space_members, users, type UserRow } from "@lumen/shared/schema/server";
 import type { Db } from "./db";
+import { shareNotification, type NewNotification } from "./social";
 
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 /** Session activity is recorded at most this often. */
 const SEEN_EVERY = 3_600_000;
 
-export function createAuth(db: Db) {
+export function createAuth(db: Db, notify: (userId: string, n: NewNotification) => void = () => {}) {
   // Verifying against a real hash when the email is unknown keeps both answers equally slow.
   const dummyHash = Bun.password.hashSync("lumen-dummy-password");
 
@@ -37,6 +38,8 @@ export function createAuth(db: Db) {
           .onConflictDoNothing()
           .run();
       db.delete(invites).where(eq(invites.id, inv.id)).run();
+      const by = db.select().from(users).where(eq(users.id, inv.invited_by)).get();
+      if (by) notify(user.id, shareNotification(inv.kind, by, inv.title, inv.role, inv.target_id, inv.space_id));
     }
   }
 

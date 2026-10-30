@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { formatHlc, type Json, type LiveMessage, type Me, type Op, type Person, type PullResponse, type PushResponse } from "@lumen/shared";
+import { formatHlc, type Friend, type Json, type LiveMessage, type LumenNotification, type Me, type Op, type Person, type PullResponse, type PushResponse } from "@lumen/shared";
 import { server_ops } from "@lumen/shared/schema/server";
 import { backfillRegistry, createApp } from "./app";
 import { openDb } from "./db";
@@ -217,5 +217,85 @@ describe("before accounts", () => {
     const b = await api.signUp("b@lumen.test");
     const again = await api.app.request("/auth/claim-legacy", { method: "POST", headers: { authorization: `Bearer ${b.token}`, "x-legacy-token": LEGACY } });
     expect(await again.json()).toEqual({ claimed: 0 });
+  });
+});
+
+describe("notifications, friends and the dictionary", () => {
+  type List = { notifications: LumenNotification[] };
+  const inbox = async (api: Api, token: string) => (await api.call<List>(token, "GET", "/notifications")).body.notifications;
+
+  it("tells people about shares once, with the page's name, including invites waiting for a signup", async () => {
+    const api = setup();
+    const { a } = await workspace(api);
+    await push(api, a.token, "a1", edit("P", "a1", "Trip plan"));
+    const b = await api.signUp("b@lumen.test", "Bo");
+    await api.call(a.token, "POST", "/pages/P/shares", { email: "b@lumen.test", role: "viewer" });
+    await api.call(a.token, "POST", "/pages/P/shares", { email: "b@lumen.test", role: "editor" }); // a role change, not a new share
+    const [n, ...rest] = await inbox(api, b.token);
+    expect(rest).toEqual([]);
+    expect(n).toMatchObject({ kind: "page_shared", title: "a shared a page with you", body: "“Trip plan” · you can view it", page_id: "P", space_id: "S" });
+    expect(n!.actor?.email).toBe("a@lumen.test");
+    expect(api.sent.some((s) => s.msg.type === "inbox" && s.users.includes(b.user.id))).toBe(true);
+
+    await api.call(a.token, "POST", "/spaces/S/members", { email: "later@lumen.test", role: "editor", title: "Home" });
+    const c = await api.signUp("later@lumen.test");
+    expect((await inbox(api, c.token)).map((x) => [x.kind, x.body])).toEqual([["space_shared", "Home · you can edit it"]]);
+
+    await api.call(b.token, "POST", "/notifications/read", {});
+    expect((await inbox(api, b.token)).every((x) => x.read_at)).toBe(true);
+    await api.call(b.token, "DELETE", "/notifications");
+    expect(await inbox(api, b.token)).toEqual([]);
+  });
+
+  it("sends, accepts and removes friend requests", async () => {
+    const api = setup();
+    const a = await api.signUp("a@lumen.test", "Ada");
+    const b = await api.signUp("b@lumen.test", "Bo");
+    expect((await api.call(a.token, "POST", "/friends", { email: "nobody@lumen.test" })).status).toBe(404);
+    expect((await api.call(a.token, "POST", "/friends", { email: "a@lumen.test" })).status).toBe(400);
+
+    const sent = await api.call<{ friends: Friend[] }>(a.token, "POST", "/friends", { email: "b@lumen.test" });
+    expect(sent.body.friends.map((f) => [f.user.email, f.status])).toEqual([["b@lumen.test", "outgoing"]]);
+    const [request] = await inbox(api, b.token);
+    expect(request).toMatchObject({ kind: "friend_request", title: "Ada wants to be friends" });
+
+    const accepted = await api.call<{ friends: Friend[] }>(b.token, "POST", `/friends/${request!.friendship_id}/accept`);
+    expect(accepted.body.friends.map((f) => [f.user.email, f.status])).toEqual([["a@lumen.test", "accepted"]]);
+    expect((await inbox(api, a.token))[0]).toMatchObject({ kind: "friend_accepted", title: "Bo accepted your friend request" });
+    expect((await inbox(api, b.token))[0]!.read_at).toBeDefined();
+    expect((await api.call(a.token, "POST", "/friends", { email: "b@lumen.test" })).status).toBe(409);
+
+    await api.call(a.token, "DELETE", `/friends/${request!.friendship_id}`);
+    expect((await api.call<{ friends: Friend[] }>(b.token, "GET", "/friends")).body.friends).toEqual([]);
+  });
+
+  it("asking someone who already asked you makes you friends", async () => {
+    const api = setup();
+    const a = await api.signUp("a@lumen.test");
+    const b = await api.signUp("b@lumen.test");
+    await api.call(a.token, "POST", "/friends", { email: "b@lumen.test" });
+    const res = await api.call<{ friends: Friend[] }>(b.token, "POST", "/friends", { email: "a@lumen.test" });
+    expect(res.body.friends[0]!.status).toBe("accepted");
+  });
+
+  it("keeps each person's dictionary", async () => {
+    const api = setup();
+    const a = await api.signUp("a@lumen.test");
+    const b = await api.signUp("b@lumen.test");
+    const change = (body: unknown) => api.call<{ words: string[] }>(a.token, "POST", "/dictionary", body);
+    expect((await change({ add: ["Syphry", "lumen", "syphry"] })).body.words).toEqual(["lumen", "Syphry"]);
+    expect((await change({ remove: ["LUMEN"], add: ["Ordo"] })).body.words).toEqual(["Ordo", "Syphry"]);
+    expect((await api.call<{ words: string[] }>(b.token, "GET", "/dictionary")).body.words).toEqual([]);
+
+    const defined = await api.call<{ entries: { word: string; meaning?: string }[] }>(a.token, "POST", "/dictionary", {
+      define: [{ word: "syphry", meaning: "The tale of the first city" }, { word: "Ashfall", meaning: "A season" }],
+    });
+    expect(defined.body.entries).toEqual([
+      { word: "Ashfall", meaning: "A season" },
+      { word: "Ordo" },
+      { word: "Syphry", meaning: "The tale of the first city" },
+    ]);
+    const cleared = await api.call<{ entries: { word: string; meaning?: string }[] }>(a.token, "POST", "/dictionary", { define: [{ word: "Ashfall", meaning: "" }] });
+    expect(cleared.body.entries[0]).toEqual({ word: "Ashfall" });
   });
 });
