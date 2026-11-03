@@ -51,6 +51,7 @@ export function createAuth(db: Db, notify: (userId: string, n: NewNotification) 
       name: input.name,
       password_hash: await Bun.password.hash(input.password),
       created_at: Date.now(),
+      birthday: null,
     };
     db.insert(users).values(user).run();
     acceptInvites(user);

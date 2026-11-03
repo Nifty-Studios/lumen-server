@@ -103,7 +103,7 @@ export function createApp(db: Db, { hub, legacyToken }: AppOptions = {}) {
     c.set("token", token);
     await next();
   };
-  for (const path of ["/auth/logout", "/auth/claim-legacy", "/auth/ai-links", "/auth/ai-links/*", "/me", "/sync/*", "/spaces/*", "/pages/*", "/notifications", "/notifications/*", "/friends", "/friends/*", "/dictionary"])
+  for (const path of ["/auth/logout", "/auth/claim-legacy", "/auth/ai-links", "/auth/ai-links/*", "/me", "/sync/*", "/spaces/*", "/pages/*", "/notifications", "/notifications/*", "/friends", "/friends/*", "/dictionary", "/profile"])
     app.use(path, signedIn);
 
   mountSocial(app, db, hub);

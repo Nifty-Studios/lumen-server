@@ -298,4 +298,16 @@ describe("notifications, friends and the dictionary", () => {
     const cleared = await api.call<{ entries: { word: string; meaning?: string }[] }>(a.token, "POST", "/dictionary", { define: [{ word: "Ashfall", meaning: "" }] });
     expect(cleared.body.entries[0]).toEqual({ word: "Ashfall" });
   });
+
+  it("keeps each person's birthday and tells their devices", async () => {
+    const api = setup();
+    const a = await api.signUp("a@lumen.test");
+    const b = await api.signUp("b@lumen.test");
+    expect((await api.call(a.token, "GET", "/profile")).body).toEqual({ birthday: null });
+    expect((await api.call(a.token, "POST", "/profile", { birthday: "1990-02-29" })).body).toEqual({ birthday: "1990-02-29" });
+    expect((await api.call(a.token, "POST", "/profile", { birthday: "13-01" })).status).toBe(400);
+    expect((await api.call(b.token, "GET", "/profile")).body).toEqual({ birthday: null });
+    expect(api.sent.some((s) => s.msg.type === "profile" && s.users.includes(a.user.id))).toBe(true);
+    expect((await api.call(a.token, "POST", "/profile", { birthday: "12-25" })).body).toEqual({ birthday: "12-25" });
+  });
 });

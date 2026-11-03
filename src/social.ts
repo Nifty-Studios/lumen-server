@@ -1,6 +1,7 @@
 // People around the notes: notifications (a page or workspace shared with you, friend
 // requests), friends, and each person's spellcheck dictionary. Devices hear about changes over
-// the live socket ({type: "inbox" | "friends" | "dictionary"}) and fetch the lists.
+// the live socket ({type: "inbox" | "friends" | "dictionary" | "profile"}) and fetch the lists.
+// Also the profile (the birthday).
 
 import type { Hono } from "hono";
 import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
@@ -8,10 +9,12 @@ import {
   dictionaryChangeSchema,
   friendRequestSchema,
   markReadSchema,
+  profileSchema,
   uuidv7,
   type Friend,
   type LumenNotification,
   type NotificationKind,
+  type Profile,
 } from "@lumen/shared";
 import { dictionary_words, friendships, notifications, users, type UserRow } from "@lumen/shared/schema/server";
 import type { Db } from "./db";
@@ -248,5 +251,20 @@ export function mountSocial(app: Hono<Env>, db: Db, hub: Hub | undefined) {
     });
     if (add.length || remove.length || define.length) hub?.notify([me], { type: "dictionary" });
     return c.json(dictionary(me));
+  });
+
+  // --- profile (the birthday the calendar celebrates) ---
+
+  const profile = (userId: string): Profile => ({ birthday: db.select({ b: users.birthday }).from(users).where(eq(users.id, userId)).get()?.b ?? null });
+
+  app.get("/profile", (c) => c.json(profile(c.get("user").id)));
+
+  app.post("/profile", async (c) => {
+    const parsed = profileSchema.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) return c.json({ error: "invalid request" }, 400);
+    const me = c.get("user").id;
+    db.update(users).set({ birthday: parsed.data.birthday }).where(eq(users.id, me)).run();
+    hub?.notify([me], { type: "profile" });
+    return c.json(profile(me));
   });
 }
